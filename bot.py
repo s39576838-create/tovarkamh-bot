@@ -58,11 +58,9 @@ MAX_ORDERS = 300   # сколько последних заказов помни
 _take_lock = asyncio.Lock()  # чтобы два менеджера не забрали один заказ одновременно
 
 
-def order_keyboard(bot_username: str) -> InlineKeyboardMarkup:
-    """Одна кнопка «Заказать» под постом: открывает чат с ботом."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Заказать", url=f"https://t.me/{bot_username}?start=order")]]
-    )
+def order_keyboard(bot_username: str = "") -> InlineKeyboardMarkup:
+    """Одна кнопка под постом. Нажатие обрабатывается прямо в канале, клиент никуда не переходит."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Заказать", callback_data="order")]])
 
 
 def is_admin(update: Update) -> bool:
@@ -130,19 +128,16 @@ def order_text(order: dict, status: str = "") -> str:
     )
 
 
-async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Клиент нажал «Заказать» в канале и «Старт» в боте."""
-    msg, user = update.message, update.effective_user
+async def create_order(context: ContextTypes.DEFAULT_TYPE, user) -> str:
+    """Создаёт заказ и пишет менеджерам. Возвращает: ok | repeat | fail | unavailable."""
     if not MANAGER_IDS:
         log.error("Не заданы MANAGER_IDS/ADMIN_IDS: некому отправлять заказы")
-        await msg.reply_text("Заказы временно недоступны. Попробуйте позже.")
-        return
+        return "unavailable"
 
     last_at: dict = context.bot_data.setdefault("last_order_at", {})
     now = time.time()
     if now - last_at.get(user.id, 0) < ORDER_COOLDOWN:
-        await msg.reply_text(CLIENT_REPLY_REPEAT)
-        return
+        return "repeat"
     last_at[user.id] = now
 
     order_id = secrets.token_hex(4)
@@ -169,15 +164,12 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not order["messages"]:
         last_at.pop(user.id, None)
-        await msg.reply_text("Не получилось передать заявку менеджеру. Попробуйте позже.")
-        return
+        return "fail"
 
     orders: dict = context.bot_data.setdefault("orders", {})
     while len(orders) >= MAX_ORDERS:
         orders.pop(next(iter(orders)))
     orders[order_id] = order
-
-    await msg.reply_text(CLIENT_REPLY)
 
     for manager_id in failed:  # предупредим тех, кому доставилось
         for reachable in order["messages"]:
@@ -188,6 +180,28 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
             except TelegramError:
                 pass
+    return "ok"
+
+
+REPLIES = {
+    "ok": CLIENT_REPLY,
+    "repeat": CLIENT_REPLY_REPEAT,
+    "fail": "Не получилось передать заявку менеджеру. Попробуйте позже.",
+    "unavailable": "Заказы временно недоступны. Попробуйте позже.",
+}
+
+
+async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Старые посты: клиент перешёл в бота по ссылке и нажал «Старт»."""
+    status = await create_order(context, update.effective_user)
+    await update.message.reply_text(REPLIES[status])
+
+
+async def on_order_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Клиент нажал «Заказать» под постом в канале: ответ всплывает прямо там."""
+    query = update.callback_query
+    status = await create_order(context, update.effective_user)
+    await query.answer(REPLIES[status], show_alert=True)
 
 
 async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -335,6 +349,7 @@ def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CallbackQueryHandler(on_order_button, pattern=r"^order$"))
     app.add_handler(CallbackQueryHandler(on_take, pattern=r"^take:"))
     app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^(pub|cancel):"))
     app.add_handler(
