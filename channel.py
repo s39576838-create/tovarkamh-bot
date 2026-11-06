@@ -110,7 +110,8 @@ BACKUP_HEAD = "🗄 Служебное сообщение бота: список
 def _backup_text(state: dict):
     data = {
         "m": state.get("menu_id"),
-        "s": {k: [v["message_id"], v.get("title", k), v.get("category", "")] for k, v in state["sections"].items()},
+        "s": {k: [v["message_id"], v.get("title", k), v.get("category", ""), 1 if v.get("absent") else 0]
+              for k, v in state["sections"].items()},
     }
     text = BACKUP_HEAD + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return text if len(text) <= 4000 else None
@@ -152,7 +153,10 @@ async def recover_from_backup(bot, chat_ids) -> dict:
             continue
         try:
             data = json.loads(text[len(BACKUP_HEAD):])
-            sections = {k: {"message_id": v[0], "title": v[1], "category": v[2]} for k, v in data["s"].items()}
+            sections = {
+                k: {"message_id": v[0], "title": v[1], "category": v[2], "absent": bool(v[3]) if len(v) > 3 else False}
+                for k, v in data["s"].items()
+            }
         except (ValueError, KeyError, IndexError, TypeError):
             continue
         log.info("Состояние восстановлено из копии в чате %s: разделов %d", chat_id, len(sections))
@@ -181,24 +185,29 @@ async def recover_state(bot, channel: str) -> dict:
             if not m:
                 continue
             title = btn.text.removesuffix(ABSENT_MARK)
+            gone = btn.text.endswith(ABSENT_MARK)
             category = next((c for c in CATEGORY_ORDER if title.startswith(c)), "")
             state["sections"][key_from_title(title)] = {
                 "message_id": int(m.group(1)),
                 "title": title,
                 "category": category,
+                "absent": gone,
             }
     log.info("Состояние восстановлено по закреплённому меню: разделов %d", len(state["sections"]))
     return state
 
 
 # ---------- План ----------
-def make_plan(sections, state: dict) -> dict:
+def make_plan(sections, state: dict, mark_absent: bool = False) -> dict:
+    """update/create — разделы из присланного сообщения; absent — разделы, которые станут «нет в наличии»
+    (только если прайс полный: mark_absent=True). Остальные разделы остаются как есть."""
     known = state.get("sections", {})
     new_keys = {s.key for s in sections}
     return {
         "update": [s for s in sections if s.key in known],
         "create": [s for s in sections if s.key not in known],
-        "absent": [k for k in known if k not in new_keys],
+        "absent": [k for k, v in known.items() if k not in new_keys and not v.get("absent")] if mark_absent else [],
+        "untouched": [k for k in known if k not in new_keys],
     }
 
 
@@ -239,14 +248,14 @@ async def _upsert(bot, channel, message_id, text, markup):
     return sent.message_id
 
 
-def _menu_markup(channel: str, state: dict, absent: set) -> InlineKeyboardMarkup:
+def _menu_markup(channel: str, state: dict, absent: set = frozenset()) -> InlineKeyboardMarkup:
     entries = sorted(
         ((v.get("category", ""), v.get("title", k), k, v["message_id"]) for k, v in state["sections"].items()),
         key=lambda e: _sort_key((e[0], e[1])),
     )
     buttons = []
     for _, title, key, mid in entries:
-        label = title + (ABSENT_MARK if key in absent else "")
+        label = title + (ABSENT_MARK if key in absent or state["sections"][key].get("absent") else "")
         buttons.append(InlineKeyboardButton(label, url=message_url(channel, mid)))
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
@@ -260,24 +269,29 @@ def _post_markup(order_markup, menu_url, with_order=True):
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def publish(bot, channel: str, sections, order_markup, state: dict, backup_chat=None) -> dict:
-    """Обновляет посты и меню. Возвращает отчёт: сколько обновлено/создано/нет в наличии.
+async def publish(bot, channel: str, sections, order_markup, state: dict, backup_chat=None,
+                  mark_absent: bool = False) -> dict:
+    """Обновляет посты и меню.
+
+    sections — разделы из присланного сообщения (это может быть часть прайса). Остальные посты не меняются,
+    кроме кнопки «К меню». Если mark_absent=True (прайс полный), разделы, которых в прайсе нет, получают
+    «Нет в наличии».
 
     Порядок: 1) создаём недостающие посты; 2) отправляем новое меню (оно должно быть последним
-    сообщением и знать ссылки на все посты); 3) правим тексты и кнопки «К меню» у постов,
-    так как ссылка ведёт на новое меню; 4) удаляем старое меню.
+    сообщением и знать ссылки на все посты); 3) правим посты, так как «К меню» ведёт на новое меню;
+    4) удаляем старое меню.
     """
     report = {"updated": 0, "created": 0, "absent": 0, "errors": []}
     known = state["sections"]
-    plan = make_plan(sections, state)
+    plan = make_plan(sections, state, mark_absent)
     stamp_line = f"\n\n<i>Обновлено {stamp()}</i>"
-    absent = set(plan["absent"])
-    old_menu = state.get("menu_id")
+    absent_now = set(plan["absent"])
+    in_message = {s.key for s in sections}
     menu_url = lambda: message_url(channel, state["menu_id"]) if state.get("menu_id") else None  # noqa: E731
 
     async def send_menu() -> bool:
         text = f"{MENU_TITLE}\nВыберите категорию 👇\n\n<i>Цены и наличие обновлены {stamp()}</i>"
-        markup = _menu_markup(channel, state, absent)
+        markup = _menu_markup(channel, state, absent_now)
         try:
             sent = await _retry(lambda: bot.send_message(
                 chat_id=channel, text=text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
@@ -297,6 +311,19 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
                 report["errors"].append("старое меню не удалилось (удалите его вручную)")
         return True
 
+    async def set_markup(key: str) -> None:
+        entry = known[key]
+        markup = _post_markup(order_markup, menu_url(), with_order=not entry.get("absent"))
+        try:
+            await _retry(lambda: bot.edit_message_reply_markup(
+                chat_id=channel, message_id=entry["message_id"], reply_markup=markup))
+            await asyncio.sleep(PACE)
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                log.warning("Кнопки поста %s не обновились: %s", entry.get("title"), exc)
+        except TelegramError as exc:
+            report["errors"].append(f"{entry.get('title', key)}: {exc}")
+
     # 1. новые посты
     for sec in sections:
         if sec.key in known:
@@ -306,19 +333,21 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
         except TelegramError as exc:
             report["errors"].append(f"{sec.title}: {exc}")
             continue
-        known[sec.key] = {"message_id": mid, "title": sec.title, "category": sec.category}
+        known[sec.key] = {"message_id": mid, "title": sec.title, "category": sec.category, "absent": False}
         report["created"] += 1
         save_state(state)
 
     # 2. новое меню
     menu_ok = await send_menu()
 
-    # 3. тексты и кнопки «К меню» у всех постов
+    # 3. посты из сообщения: текст + кнопки
     recreated = []
+    update_keys = {s.key for s in plan["update"]}
     for sec in sections:
         if sec.key not in known:
             continue  # пост не создался: меню о нём не знает
         entry = known[sec.key]
+        entry.update(title=sec.title, category=sec.category, absent=False)
         try:
             mid = await _upsert(bot, channel, entry["message_id"], sec.text + stamp_line,
                                 _post_markup(order_markup, menu_url()))
@@ -329,30 +358,32 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
             entry["message_id"] = mid
             recreated.append(sec.key)
             report["created"] += 1
-        elif sec.key in {s.key for s in plan["update"]}:
+        elif sec.key in update_keys:
             report["updated"] += 1
         save_state(state)
 
+    # разделы, которых нет в полном прайсе
     for key in plan["absent"]:
         entry = known[key]
+        entry["absent"] = True
         text = f"<b>{entry['title']}</b>\n\nНет в наличии.{stamp_line}"
         try:
             await _upsert(bot, channel, entry["message_id"], text, _post_markup(order_markup, menu_url(), False))
             report["absent"] += 1
         except TelegramError as exc:
             report["errors"].append(f"{entry['title']}: {exc}")
+        save_state(state)
+
+    # остальные посты не меняем, только обновляем у них ссылку «К меню» (меню пересоздано)
+    for key in plan["untouched"]:
+        if key not in absent_now and key in known:
+            await set_markup(key)
 
     # пост, удалённый вручную, пересоздан уже после меню: обновим меню и его кнопку
     if recreated and menu_ok:
-        save_state(state)
         if await send_menu():
             for key in recreated:
-                sec = next(x for x in sections if x.key == key)
-                try:
-                    await _upsert(bot, channel, known[key]["message_id"], sec.text + stamp_line,
-                                  _post_markup(order_markup, menu_url()))
-                except TelegramError as exc:
-                    report["errors"].append(f"{sec.title}: {exc}")
+                await set_markup(key)
 
     if backup_chat:
         await backup_state(bot, backup_chat, state)
