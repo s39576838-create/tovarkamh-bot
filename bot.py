@@ -282,14 +282,17 @@ def plan_text(sections, plan, state) -> str:
     def line(sec):
         return f"  • {sec.title} — {len(sec.items)} шт."
 
-    text = f"Разделов в каталоге: {len(sections)}"
+    text = f"Разделов в этом сообщении: {len(sections)}"
     if plan["update"]:
         text += f"\n\n🔄 Обновлю посты ({len(plan['update'])}):\n" + "\n".join(line(x) for x in plan["update"])
     if plan["create"]:
         text += f"\n\n🆕 Создам новые посты ({len(plan['create'])}):\n" + "\n".join(line(x) for x in plan["create"])
-    if plan["absent"]:
-        names = [state["sections"][k].get("title", k) for k in plan["absent"]]
-        text += f"\n\n🚫 Помечу «Нет в наличии» ({len(names)}):\n" + "\n".join(f"  • {n}" for n in names)
+    others = [state["sections"][k].get("title", k) for k in plan["untouched"] if not state["sections"][k].get("absent")]
+    if others:
+        text += (
+            f"\n\nОстальные разделы ({len(others)}) не изменятся: " + ", ".join(others)
+            + ".\nЕсли это полный прайс, нажмите «Полный прайс»: они получат «Нет в наличии»."
+        )
     return text
 
 
@@ -316,7 +319,7 @@ async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     state = await get_state(context)
-    plan = channel_mod.make_plan(sections, state)
+    plan = channel_mod.make_plan(sections, state, mark_absent=False)
 
     pending: dict = context.bot_data.setdefault("pending", {})
     while len(pending) >= MAX_PENDING:
@@ -332,10 +335,11 @@ async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         plan_text(sections, plan, state) + first + "\n\n" + make_report(res)
         + f"\n\nОбновить каталог в {CHANNEL}?",
         reply_markup=InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub:{token}"),
-                InlineKeyboardButton("❌ Отмена", callback_data=f"cancel:{token}"),
-            ]]
+            [
+                [InlineKeyboardButton("✅ Опубликовать эти разделы", callback_data=f"pub:{token}")],
+                [InlineKeyboardButton("📋 Полный прайс (остальных нет)", callback_data=f"full:{token}")],
+                [InlineKeyboardButton("❌ Отмена", callback_data=f"cancel:{token}")],
+            ]
         ),
     )
 
@@ -364,7 +368,7 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             rep = await channel_mod.publish(
                 context.bot, CHANNEL, sections, order_keyboard(context.bot.username), state,
-                backup_chat=update.effective_user.id,
+                backup_chat=update.effective_user.id, mark_absent=(action == "full"),
             )
         except TelegramError as exc:
             log.exception("Не удалось обновить каталог")
@@ -385,7 +389,7 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"\n\n⚠️ Не удалось ({len(rep['errors'])}):\n{shown}\n"
             "Нажмите «Повторить»: бот доделает только недостающее."
         )
-        retry_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Повторить", callback_data=f"pub:{token}")]])
+        retry_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Повторить", callback_data=f"{action}:{token}")]])
     else:
         pending.pop(token, None)
     await query.edit_message_text(text, reply_markup=retry_markup)
@@ -414,7 +418,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CallbackQueryHandler(on_order_button, pattern=r"^order$"))
     app.add_handler(CallbackQueryHandler(on_take, pattern=r"^take:"))
-    app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^(pub|cancel):"))
+    app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^(pub|full|cancel):"))
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
