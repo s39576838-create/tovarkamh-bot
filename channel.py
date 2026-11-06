@@ -6,6 +6,7 @@
 хостинг пересобрал контейнер), состояние восстанавливается из этой копии.
 Меню «Каталог» после каждого обновления пересоздаётся и всегда остаётся последним в канале.
 """
+import asyncio
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError, TimedOut
 
 from catalog import CATEGORY_ORDER, _iphone_sort_key
 
@@ -26,6 +27,28 @@ MSK = timezone(timedelta(hours=3))
 MENU_TITLE = "📋 <b>Каталог</b>"
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 ABSENT_MARK = " (нет)"
+# Telegram пускает в канал около 20 сообщений в минуту: между записями в канал делаем паузу
+PACE = float(os.getenv("PACE_SECONDS", "3"))
+
+
+async def _retry(call, attempts: int = 4):
+    """Выполняет запрос; при «Flood control» ждёт, сколько просит Telegram, при таймауте пробует снова."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call()
+        except RetryAfter as exc:
+            if attempt == attempts:
+                raise
+            ra = exc.retry_after
+            wait = ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)
+            log.warning("Flood control: жду %.0f с", wait + 1)
+            await asyncio.sleep(wait + 1)
+        except TimedOut:
+            if attempt == attempts:
+                raise
+            log.warning("Таймаут, повторяю (%d)", attempt)
+            await asyncio.sleep(2)
+
 
 
 # ---------- Состояние ----------
@@ -195,10 +218,11 @@ async def _upsert(bot, channel, message_id, text, markup):
     """Редактирует сообщение; если его нет (удалено) — отправляет новое. Возвращает id."""
     if message_id:
         try:
-            await bot.edit_message_text(
+            await _retry(lambda: bot.edit_message_text(
                 chat_id=channel, message_id=message_id, text=text,
                 parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW, reply_markup=markup,
-            )
+            ))
+            await asyncio.sleep(PACE)
             return message_id
         except BadRequest as exc:
             msg = str(exc).lower()
@@ -207,10 +231,11 @@ async def _upsert(bot, channel, message_id, text, markup):
             if not ("not found" in msg or "can't be edited" in msg or "message to edit" in msg):
                 raise
             log.warning("Сообщение %s не найдено, отправляю новое: %s", message_id, exc)
-    sent = await bot.send_message(
+    sent = await _retry(lambda: bot.send_message(
         chat_id=channel, text=text, parse_mode=ParseMode.HTML,
         link_preview_options=NO_PREVIEW, reply_markup=markup,
-    )
+    ))
+    await asyncio.sleep(PACE)
     return sent.message_id
 
 
@@ -258,10 +283,11 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
     menu_text = f"{MENU_TITLE}\nВыберите категорию 👇\n\n<i>Цены и наличие обновлены {stamp()}</i>"
     old_menu = state.get("menu_id")
     try:
-        sent = await bot.send_message(
+        markup = _menu_markup(channel, state, absent)
+        sent = await _retry(lambda: bot.send_message(
             chat_id=channel, text=menu_text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
-            reply_markup=_menu_markup(channel, state, absent), disable_notification=True,
-        )
+            reply_markup=markup, disable_notification=True,
+        ))
     except TelegramError as exc:
         report["errors"].append(f"меню: {exc}")
     else:
@@ -269,7 +295,7 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
         save_state(state)
         if old_menu:  # старое меню убираем, чтобы новое всегда было в самом низу
             try:
-                await bot.delete_message(chat_id=channel, message_id=old_menu)
+                await _retry(lambda: bot.delete_message(chat_id=channel, message_id=old_menu))
             except TelegramError as exc:
                 log.warning("Не удалось удалить старое меню %s: %s", old_menu, exc)
                 report["errors"].append("старое меню не удалилось (удалите его вручную)")
