@@ -1,12 +1,17 @@
 """Telegram-бот для канала @tovarkamh.
 
-Вы отправляете боту пост поставщика -> бот собирает готовый пост (правила в catalog.py),
-показывает предпросмотр и после нажатия «Опубликовать» выкладывает его в канал с кнопками «Заказать».
+1. Вы отправляете боту пост поставщика -> бот собирает готовый пост (правила в catalog.py),
+   показывает предпросмотр и после нажатия «Опубликовать» выкладывает его в канал.
+2. Под постом одна кнопка «Заказать». Клиент нажимает её, открывается чат с ботом, и бот
+   сразу пишет всем менеджерам. Первый, кто нажал «Беру», забирает заказ, остальные получают уведомление.
 """
 
+import asyncio
+import html
 import logging
 import os
 import secrets
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,28 +33,43 @@ load_dotenv(Path(__file__).with_name("config.env"))
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("tovarkamh_bot")
 
+
+def _parse_ids(name: str) -> set:
+    return {int(x) for x in os.getenv(name, "").replace(" ", "").split(",") if x.isdigit()}
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL = os.getenv("CHANNEL", "@tovarkamh").strip()
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+ADMIN_IDS = _parse_ids("ADMIN_IDS")  # кто может публиковать посты
+# Кому приходят заказы. Если MANAGER_IDS не задан, заказы получают все из ADMIN_IDS.
+MANAGER_IDS = _parse_ids("MANAGER_IDS") or ADMIN_IDS
 
-# Кнопки под постом в канале: (текст, ссылка). Одна кнопка не может вести в два чата,
-# поэтому их две — по одной на каждый чат.
-ORDER_BUTTONS = [
-    ("Заказать · @maloysy", "https://t.me/maloysy"),
-    ("Заказать · @lelik4501", "https://t.me/lelik4501"),
-]
+CLIENT_REPLY = "Спасибо! Менеджер скоро свяжется с вами."
+CLIENT_REPLY_REPEAT = "Ваша заявка уже отправлена. Менеджер скоро свяжется с вами."
+ORDER_COOLDOWN = 120  # секунд: повторное нажатие «Заказать» за это время не создаёт новый заказ
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
-MAX_PENDING = 20  # сколько подготовленных постов держим в памяти
+MAX_PENDING = 20   # сколько подготовленных постов держим в памяти
+MAX_ORDERS = 300   # сколько последних заказов помним для кнопки «Беру»
+
+_take_lock = asyncio.Lock()  # чтобы два менеджера не забрали один заказ одновременно
 
 
-def order_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(text, url=url) for text, url in ORDER_BUTTONS]])
+def order_keyboard(bot_username: str) -> InlineKeyboardMarkup:
+    """Одна кнопка «Заказать» под постом: открывает чат с ботом."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Заказать", url=f"https://t.me/{bot_username}?start=order")]]
+    )
 
 
 def is_admin(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id in ADMIN_IDS)
+
+
+def person_name(user) -> str:
+    name = user.full_name or user.username or str(user.id)
+    return f"{name} (@{user.username})" if user.username and user.full_name else name
 
 
 def make_report(res, limit: int = 12) -> str:
@@ -69,24 +89,156 @@ def make_report(res, limit: int = 12) -> str:
     return text
 
 
+# ─────────────────────────── /start, /id ───────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Привет! Перешлите мне пост поставщика (или вставьте его текст).\n"
-        "Я отфильтрую товары, посчитаю цены и покажу готовый пост. "
-        f"После вашего подтверждения опубликую его в {CHANNEL}.\n\n"
-        "/id — показать ваш Telegram ID"
-    )
+    args = context.args or []
+    if args and args[0] == "order":
+        await handle_order(update, context)
+        return
+
+    user_id = update.effective_user.id
+    if is_admin(update):
+        text = (
+            "Привет! Перешлите мне пост поставщика (или вставьте его текст).\n"
+            "Я отфильтрую товары, посчитаю цены и покажу готовый пост. "
+            f"После вашего подтверждения опубликую его в {CHANNEL}.\n\n"
+            "/id — показать ваш Telegram ID"
+        )
+        if user_id in MANAGER_IDS:
+            text += "\n\nВы также получаете сюда заказы от клиентов."
+    elif user_id in MANAGER_IDS:
+        text = "Вы подключены как менеджер. Заказы от клиентов будут приходить сюда."
+    else:
+        text = f"Здравствуйте! Чтобы сделать заказ, нажмите кнопку «Заказать» под постом в канале {CHANNEL}."
+    await update.message.reply_text(text)
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}")
 
 
+# ─────────────────────────── заказы ───────────────────────────
+def order_text(order: dict, status: str = "") -> str:
+    who = f'<a href="tg://user?id={order["client_id"]}">{html.escape(order["name"])}</a>'
+    if order["username"]:
+        who += f' (@{html.escape(order["username"])})'
+    return "\n".join(
+        ["🛒 <b>Новый заказ</b>", f"Клиент: {who}", status or "Нажмите «Беру», чтобы забрать заказ."]
+    )
+
+
+async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Клиент нажал «Заказать» в канале и «Старт» в боте."""
+    msg, user = update.message, update.effective_user
+    if not MANAGER_IDS:
+        log.error("Не заданы MANAGER_IDS/ADMIN_IDS: некому отправлять заказы")
+        await msg.reply_text("Заказы временно недоступны. Попробуйте позже.")
+        return
+
+    last_at: dict = context.bot_data.setdefault("last_order_at", {})
+    now = time.time()
+    if now - last_at.get(user.id, 0) < ORDER_COOLDOWN:
+        await msg.reply_text(CLIENT_REPLY_REPEAT)
+        return
+    last_at[user.id] = now
+
+    order_id = secrets.token_hex(4)
+    order = {
+        "client_id": user.id,
+        "name": user.full_name or user.username or str(user.id),
+        "username": user.username,
+        "taken_by": None,
+        "taken_by_name": "",
+        "messages": {},  # id менеджера -> id сообщения с уведомлением
+    }
+
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✋ Беру", callback_data=f"take:{order_id}")]])
+    failed = []
+    for manager_id in sorted(MANAGER_IDS):
+        try:
+            sent = await context.bot.send_message(
+                chat_id=manager_id, text=order_text(order), parse_mode=ParseMode.HTML, reply_markup=keyboard
+            )
+            order["messages"][manager_id] = sent.message_id
+        except TelegramError as exc:
+            log.warning("Не удалось отправить заказ менеджеру %s: %s", manager_id, exc)
+            failed.append(manager_id)
+
+    if not order["messages"]:
+        last_at.pop(user.id, None)
+        await msg.reply_text("Не получилось передать заявку менеджеру. Попробуйте позже.")
+        return
+
+    orders: dict = context.bot_data.setdefault("orders", {})
+    while len(orders) >= MAX_ORDERS:
+        orders.pop(next(iter(orders)))
+    orders[order_id] = order
+
+    await msg.reply_text(CLIENT_REPLY)
+
+    for manager_id in failed:  # предупредим тех, кому доставилось
+        for reachable in order["messages"]:
+            try:
+                await context.bot.send_message(
+                    chat_id=reachable,
+                    text=f"⚠️ Менеджеру с ID {manager_id} уведомление не доставлено: он ещё не нажал «Старт» в боте.",
+                )
+            except TelegramError:
+                pass
+
+
+async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Менеджер нажал «Беру»."""
+    query, user = update.callback_query, update.effective_user
+    if user.id not in MANAGER_IDS:
+        await query.answer("Нет доступа", show_alert=True)
+        return
+
+    order_id = (query.data or "").partition(":")[2]
+    orders: dict = context.bot_data.setdefault("orders", {})
+
+    async with _take_lock:  # внутри блока заказ может забрать только один человек
+        order = orders.get(order_id)
+        if order is None:
+            await query.answer(
+                "Заказ устарел: бот перезапускался. Решите между собой, кто пишет клиенту.", show_alert=True
+            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            return
+        if order["taken_by"] is not None:
+            taker = order["taken_by_name"]
+            await query.answer(f"Заказ уже взял {taker}", show_alert=True)
+            try:
+                await query.edit_message_text(
+                    order_text(order, f"✅ Заказ взял: {html.escape(taker)}"), parse_mode=ParseMode.HTML
+                )
+            except TelegramError:
+                pass
+            return
+        order["taken_by"] = user.id
+        order["taken_by_name"] = person_name(user)
+
+    await query.answer("Вы взяли заказ")
+    taker = html.escape(order["taken_by_name"])
+    for manager_id, message_id in order["messages"].items():
+        status = "✅ <b>Вы взяли этот заказ.</b> Напишите клиенту." if manager_id == user.id else f"✅ Заказ взял: {taker}"
+        try:
+            await context.bot.edit_message_text(
+                chat_id=manager_id, message_id=message_id, text=order_text(order, status), parse_mode=ParseMode.HTML
+            )
+        except TelegramError as exc:
+            log.warning("Не удалось обновить уведомление у %s: %s", manager_id, exc)
+
+
+# ─────────────────────────── публикация прайса ───────────────────────────
 async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not ADMIN_IDS:
         await msg.reply_text(
-            "В config.env пока не указан ADMIN_IDS. Отправьте /id, впишите число в config.env "
+            "В настройках пока не указан ADMIN_IDS. Отправьте /id, впишите число в настройки "
             "и перезапустите бота."
         )
         return
@@ -113,7 +265,7 @@ async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             chunk,
             parse_mode=ParseMode.HTML,
             link_preview_options=NO_PREVIEW,
-            reply_markup=order_keyboard() if last else None,
+            reply_markup=order_keyboard(context.bot.username) if last else None,
         )
 
     pending: dict = context.bot_data.setdefault("pending", {})
@@ -160,7 +312,7 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 text=chunk,
                 parse_mode=ParseMode.HTML,
                 link_preview_options=NO_PREVIEW,
-                reply_markup=order_keyboard() if last else None,
+                reply_markup=order_keyboard(context.bot.username) if last else None,
             )
             sent += 1
     except TelegramError as exc:
@@ -180,6 +332,7 @@ def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CallbackQueryHandler(on_take, pattern=r"^take:"))
     app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^(pub|cancel):"))
     app.add_handler(
         MessageHandler(
@@ -192,8 +345,11 @@ def build_app() -> Application:
 
 def main() -> None:
     if not BOT_TOKEN:
-        raise SystemExit("Не задан BOT_TOKEN. Впишите токен от @BotFather в файл config.env.")
-    log.info("Бот запущен. Канал: %s, администраторов: %d", CHANNEL, len(ADMIN_IDS))
+        raise SystemExit("Не задан BOT_TOKEN. Впишите токен от @BotFather в настройки (config.env или переменные окружения).")
+    log.info(
+        "Бот запущен. Канал: %s, администраторов: %d, менеджеров: %d",
+        CHANNEL, len(ADMIN_IDS), len(MANAGER_IDS),
+    )
     build_app().run_polling(allowed_updates=Update.ALL_TYPES)
 
 
