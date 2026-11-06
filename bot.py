@@ -9,6 +9,7 @@
 
 import asyncio
 import html
+import re
 import logging
 import os
 import secrets
@@ -107,6 +108,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Я отфильтрую товары, посчитаю цены и покажу готовый пост. "
             f"После вашего подтверждения опубликую его в {CHANNEL}.\n\n"
             "/id — показать ваш Telegram ID\n"
+            "/notify — вручную уведомить подписчиков об обновлении цен\n"
+            "/off — отметить раздел «Нет в наличии»\n"
             "/reset — забыть посты каталога в канале (создать заново)"
         )
         if user_id in MANAGER_IDS:
@@ -127,12 +130,14 @@ def order_text(order: dict, status: str = "") -> str:
     who = f'<a href="tg://user?id={order["client_id"]}">{html.escape(order["name"])}</a>'
     if order["username"]:
         who += f' (@{html.escape(order["username"])})'
-    return "\n".join(
-        ["🛒 <b>Новый заказ</b>", f"Клиент: {who}", status or "Нажмите «Беру», чтобы забрать заказ."]
-    )
+    lines = ["🛒 <b>Новый заказ</b>", f"Клиент: {who}"]
+    if order.get("section"):
+        lines.append(f"Раздел: <b>{html.escape(order['section'])}</b>")
+    lines.append(status or "Нажмите «Беру», чтобы забрать заказ.")
+    return "\n".join(lines)
 
 
-async def create_order(context: ContextTypes.DEFAULT_TYPE, user) -> str:
+async def create_order(context: ContextTypes.DEFAULT_TYPE, user, section_key=None) -> str:
     """Создаёт заказ и пишет менеджерам. Возвращает: ok | repeat | fail | unavailable."""
     if not MANAGER_IDS:
         log.error("Не заданы MANAGER_IDS/ADMIN_IDS: некому отправлять заказы")
@@ -149,10 +154,15 @@ async def create_order(context: ContextTypes.DEFAULT_TYPE, user) -> str:
         "client_id": user.id,
         "name": user.full_name or user.username or str(user.id),
         "username": user.username,
+        "section": None,
         "taken_by": None,
         "taken_by_name": "",
         "messages": {},  # id менеджера -> id сообщения с уведомлением
     }
+
+    if section_key:
+        state = await get_state(context)
+        order["section"] = state["sections"].get(section_key, {}).get("title")
 
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✋ Беру", callback_data=f"take:{order_id}")]])
     failed = []
@@ -204,7 +214,8 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def on_order_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Клиент нажал «Заказать» под постом в канале: ответ всплывает прямо там."""
     query = update.callback_query
-    status = await create_order(context, update.effective_user)
+    _, _, section_key = (query.data or "").partition(":")
+    status = await create_order(context, update.effective_user, section_key or None)
     await safe_answer(query, REPLIES[status], show_alert=True)
 
 
@@ -291,7 +302,7 @@ def plan_text(sections, plan, state) -> str:
     if others:
         text += (
             f"\n\nОстальные разделы ({len(others)}) не изменятся: " + ", ".join(others)
-            + ".\nЕсли это полный прайс, нажмите «Полный прайс»: они получат «Нет в наличии»."
+            + ".\nЕсли какой-то раздел закончился, уберите его командой /off."
         )
     return text
 
@@ -337,7 +348,6 @@ async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("✅ Опубликовать эти разделы", callback_data=f"pub:{token}")],
-                [InlineKeyboardButton("📋 Полный прайс (остальных нет)", callback_data=f"full:{token}")],
                 [InlineKeyboardButton("❌ Отмена", callback_data=f"cancel:{token}")],
             ]
         ),
@@ -392,7 +402,107 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         retry_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Повторить", callback_data=f"{action}:{token}")]])
     else:
         pending.pop(token, None)
+        text += "\n\nПосты опубликованы без звука. Подписчикам можно отправить уведомление вручную."
+        retry_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔔 Уведомить подписчиков", callback_data="notify")]])
     await query.edit_message_text(text, reply_markup=retry_markup)
+
+
+DEFAULT_NOTICE = "🔔 <b>Обновили цены и наличие</b>\nАктуальный каталог — в меню ниже 👇"
+
+
+async def cmd_notify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/notify [текст] — вручную отправить подписчикам уведомление об обновлении (со звуком)."""
+    if not is_admin(update):
+        return
+    custom = " ".join(context.args or []).strip()
+    context.bot_data["notice_text"] = html.escape(custom) if custom else DEFAULT_NOTICE
+    await update.message.reply_text(
+        "Отправить подписчикам канала уведомление (со звуком)?\n\n" + re.sub(r"</?b>", "", context.bot_data["notice_text"]),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, отправить", callback_data="notify_yes"),
+            InlineKeyboardButton("Нет", callback_data="notify_no"),
+        ]]),
+    )
+
+
+async def on_notify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await safe_answer(query)
+    if not is_admin(update):
+        return
+    if query.data == "notify":  # кнопка под отчётом о публикации
+        context.bot_data["notice_text"] = DEFAULT_NOTICE
+        await query.edit_message_text(
+            "Отправить подписчикам канала уведомление (со звуком)?\n\n" + re.sub(r"</?b>", "", DEFAULT_NOTICE),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, отправить", callback_data="notify_yes"),
+                InlineKeyboardButton("Нет", callback_data="notify_no"),
+            ]]),
+        )
+        return
+    if query.data == "notify_no":
+        await query.edit_message_text("Уведомление не отправлено.")
+        return
+    await query.edit_message_text("⏳ Отправляю уведомление…")
+    async with _publish_lock:
+        state = await get_state(context)
+        try:
+            await channel_mod.notify_update(
+                context.bot, CHANNEL, state, context.bot_data.get("notice_text", DEFAULT_NOTICE),
+                backup_chat=update.effective_user.id,
+            )
+        except TelegramError as exc:
+            await query.edit_message_text(f"❌ Не получилось отправить уведомление: {exc}")
+            return
+    await query.edit_message_text("✅ Уведомление отправлено, меню снова внизу канала.")
+
+
+async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/off — показать разделы кнопками; выбранный получит «Нет в наличии»."""
+    if not is_admin(update):
+        return
+    state = await get_state(context)
+    rows = [
+        [InlineKeyboardButton(v.get("title", k), callback_data=f"off:{k}")]
+        for k, v in state["sections"].items()
+        if not v.get("absent") and len(f"off:{k}".encode("utf-8")) <= 64
+    ]
+    if not rows:
+        await update.message.reply_text("Сейчас нет разделов в наличии.")
+        return
+    rows.append([InlineKeyboardButton("Отмена", callback_data="off_cancel")])
+    await update.message.reply_text(
+        "Какой раздел закончился? Он получит «Нет в наличии». Вернётся в наличие, когда вы пришлёте его прайс снова.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def on_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await safe_answer(query)
+    if not is_admin(update):
+        return
+    if query.data == "off_cancel":
+        await query.edit_message_text("Отменено.")
+        return
+    key = query.data.split(":", 1)[1]
+    await query.edit_message_text("⏳ Обновляю канал…")
+    async with _publish_lock:
+        state = await get_state(context)
+        if key not in state["sections"]:
+            await query.edit_message_text("Такого раздела уже нет.")
+            return
+        title = state["sections"][key].get("title", key)
+        try:
+            rep = await channel_mod.publish(
+                context.bot, CHANNEL, [], None, state,
+                backup_chat=update.effective_user.id, absent_keys=[key],
+            )
+        except TelegramError as exc:
+            await query.edit_message_text(f"❌ Не получилось: {exc}")
+            return
+    extra = f"\n⚠️ {'; '.join(rep['errors'][:3])}" if rep["errors"] else ""
+    await query.edit_message_text(f"✅ «{title}» теперь «Нет в наличии».{extra}")
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -416,7 +526,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CallbackQueryHandler(on_order_button, pattern=r"^order$"))
+    app.add_handler(CommandHandler("notify", cmd_notify))
+    app.add_handler(CommandHandler("off", cmd_off))
+    app.add_handler(CallbackQueryHandler(on_notify, pattern=r"^notify"))
+    app.add_handler(CallbackQueryHandler(on_off, pattern=r"^off"))
+    app.add_handler(CallbackQueryHandler(on_order_button, pattern=r"^order(:|$)"))
     app.add_handler(CallbackQueryHandler(on_take, pattern=r"^take:"))
     app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^(pub|full|cancel):"))
     app.add_handler(
