@@ -252,53 +252,108 @@ def _menu_markup(channel: str, state: dict, absent: set) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(rows)
 
 
+def _post_markup(order_markup, menu_url, with_order=True):
+    """Кнопки под постом: «Заказать» (если товар есть) и «К меню»."""
+    rows = list(order_markup.inline_keyboard) if with_order else []
+    if menu_url:
+        rows.append([InlineKeyboardButton("⬅️ К меню", url=menu_url)])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 async def publish(bot, channel: str, sections, order_markup, state: dict, backup_chat=None) -> dict:
-    """Обновляет посты и меню. Возвращает отчёт: сколько обновлено/создано/нет в наличии."""
+    """Обновляет посты и меню. Возвращает отчёт: сколько обновлено/создано/нет в наличии.
+
+    Порядок: 1) создаём недостающие посты; 2) отправляем новое меню (оно должно быть последним
+    сообщением и знать ссылки на все посты); 3) правим тексты и кнопки «К меню» у постов,
+    так как ссылка ведёт на новое меню; 4) удаляем старое меню.
+    """
     report = {"updated": 0, "created": 0, "absent": 0, "errors": []}
     known = state["sections"]
     plan = make_plan(sections, state)
     stamp_line = f"\n\n<i>Обновлено {stamp()}</i>"
+    absent = set(plan["absent"])
+    old_menu = state.get("menu_id")
+    menu_url = lambda: message_url(channel, state["menu_id"]) if state.get("menu_id") else None  # noqa: E731
 
-    for sec in sections:
-        old = known.get(sec.key, {}).get("message_id")
+    async def send_menu() -> bool:
+        text = f"{MENU_TITLE}\nВыберите категорию 👇\n\n<i>Цены и наличие обновлены {stamp()}</i>"
+        markup = _menu_markup(channel, state, absent)
         try:
-            mid = await _upsert(bot, channel, old, sec.text + stamp_line, order_markup)
+            sent = await _retry(lambda: bot.send_message(
+                chat_id=channel, text=text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+                reply_markup=markup, disable_notification=True,
+            ))
+        except TelegramError as exc:
+            report["errors"].append(f"меню: {exc}")
+            return False
+        prev = state.get("menu_id")
+        state["menu_id"] = sent.message_id
+        save_state(state)
+        if prev:  # старое меню убираем, чтобы новое всегда было в самом низу
+            try:
+                await _retry(lambda: bot.delete_message(chat_id=channel, message_id=prev))
+            except TelegramError as exc:
+                log.warning("Не удалось удалить старое меню %s: %s", prev, exc)
+                report["errors"].append("старое меню не удалилось (удалите его вручную)")
+        return True
+
+    # 1. новые посты
+    for sec in sections:
+        if sec.key in known:
+            continue
+        try:
+            mid = await _upsert(bot, channel, None, sec.text + stamp_line, _post_markup(order_markup, menu_url()))
         except TelegramError as exc:
             report["errors"].append(f"{sec.title}: {exc}")
             continue
         known[sec.key] = {"message_id": mid, "title": sec.title, "category": sec.category}
-        report["created" if old is None or old != mid else "updated"] += 1
+        report["created"] += 1
+        save_state(state)
+
+    # 2. новое меню
+    menu_ok = await send_menu()
+
+    # 3. тексты и кнопки «К меню» у всех постов
+    recreated = []
+    for sec in sections:
+        if sec.key not in known:
+            continue  # пост не создался: меню о нём не знает
+        entry = known[sec.key]
+        try:
+            mid = await _upsert(bot, channel, entry["message_id"], sec.text + stamp_line,
+                                _post_markup(order_markup, menu_url()))
+        except TelegramError as exc:
+            report["errors"].append(f"{sec.title}: {exc}")
+            continue
+        if mid != entry["message_id"]:
+            entry["message_id"] = mid
+            recreated.append(sec.key)
+            report["created"] += 1
+        elif sec.key in {s.key for s in plan["update"]}:
+            report["updated"] += 1
         save_state(state)
 
     for key in plan["absent"]:
         entry = known[key]
         text = f"<b>{entry['title']}</b>\n\nНет в наличии.{stamp_line}"
         try:
-            await _upsert(bot, channel, entry["message_id"], text, None)
+            await _upsert(bot, channel, entry["message_id"], text, _post_markup(order_markup, menu_url(), False))
             report["absent"] += 1
         except TelegramError as exc:
             report["errors"].append(f"{entry['title']}: {exc}")
 
-    absent = set(plan["absent"])
-    menu_text = f"{MENU_TITLE}\nВыберите категорию 👇\n\n<i>Цены и наличие обновлены {stamp()}</i>"
-    old_menu = state.get("menu_id")
-    try:
-        markup = _menu_markup(channel, state, absent)
-        sent = await _retry(lambda: bot.send_message(
-            chat_id=channel, text=menu_text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
-            reply_markup=markup, disable_notification=True,
-        ))
-    except TelegramError as exc:
-        report["errors"].append(f"меню: {exc}")
-    else:
-        state["menu_id"] = sent.message_id
+    # пост, удалённый вручную, пересоздан уже после меню: обновим меню и его кнопку
+    if recreated and menu_ok:
         save_state(state)
-        if old_menu:  # старое меню убираем, чтобы новое всегда было в самом низу
-            try:
-                await _retry(lambda: bot.delete_message(chat_id=channel, message_id=old_menu))
-            except TelegramError as exc:
-                log.warning("Не удалось удалить старое меню %s: %s", old_menu, exc)
-                report["errors"].append("старое меню не удалилось (удалите его вручную)")
+        if await send_menu():
+            for key in recreated:
+                sec = next(x for x in sections if x.key == key)
+                try:
+                    await _upsert(bot, channel, known[key]["message_id"], sec.text + stamp_line,
+                                  _post_markup(order_markup, menu_url()))
+                except TelegramError as exc:
+                    report["errors"].append(f"{sec.title}: {exc}")
+
     if backup_chat:
         await backup_state(bot, backup_chat, state)
     return report
