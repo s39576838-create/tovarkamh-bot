@@ -154,7 +154,8 @@ def classify(name: str):
 
 
 # ---------- Сборка поста ----------
-def build_post(text: str) -> BuildResult:
+def _collect(text: str):
+    """Разбирает прайс: возвращает (BuildResult без блоков, {категория: {группа: [Item]}})."""
     result = BuildResult()
     by_category = {}  # категория -> {группа: [Item, ...]} (порядок появления сохраняется)
 
@@ -191,7 +192,11 @@ def build_post(text: str) -> BuildResult:
         item = Item(name, retail_price(source_price), category, group)
         by_category.setdefault(category, {}).setdefault(group, []).append(item)
         result.kept += 1
+    return result, by_category
 
+
+def build_post(text: str) -> BuildResult:
+    result, by_category = _collect(text)
     for category in CATEGORY_ORDER:
         groups = by_category.get(category)
         if not groups:
@@ -246,3 +251,94 @@ def split_for_telegram(blocks, limit: int = TELEGRAM_LIMIT):
     if current:
         chunks.append(current)
     return chunks
+
+
+# ---------- Разделы для канала (этап 2) ----------
+SECTION_LIMIT = 3800  # запас под строку «Обновлено …» и заголовок
+
+
+@dataclass
+class Section:
+    key: str       # стабильный ключ: «iPhone 15#1»; по нему бот находит свой пост в канале
+    title: str     # заголовок поста, например «Samsung A» или «Samsung A (1/2)»
+    category: str
+    items: list
+    text: str      # готовый HTML поста без строки «Обновлено»
+
+
+def _samsung_series(name: str) -> str:
+    low = name.lower()
+    if re.search(r"z\s?(?:fold|flip)|\bfold|\bflip", low):
+        return "Samsung Z"
+    m = re.search(r"\b([asmf])\d", low)
+    if m:
+        return f"Samsung {m.group(1).upper()}"
+    if re.search(r"note", low):
+        return "Samsung Note"
+    return "Samsung"
+
+
+def _galaxy_series(name: str) -> str:
+    m = re.search(r"\b(watch|buds|tab|ring|book)\b", name, re.IGNORECASE)
+    return f"Galaxy {m.group(1).capitalize()}" if m else "Galaxy"
+
+
+SERIES_FUNCS = {"Samsung": _samsung_series, "Galaxy": _galaxy_series}
+
+
+def _item_line(it: Item) -> str:
+    return f"▫️ {html.escape(it.name, quote=False)} – {format_price(it.price)}"
+
+
+def _fits(title: str, items) -> bool:
+    body = "\n".join(_item_line(i) for i in items)
+    return len(title) + 8 + len(body) <= SECTION_LIMIT
+
+
+def _pack(title: str, category: str, items) -> list:
+    """Делит товары на части по размеру: «Название (1/2)», «Название (2/2)»."""
+    parts, current, size = [], [], 0
+    budget = SECTION_LIMIT - len(title) - 20
+    for it in items:
+        add = len(_item_line(it)) + 1
+        if current and size + add > budget:
+            parts.append(current)
+            current, size = [], 0
+        current.append(it)
+        size += add
+    if current:
+        parts.append(current)
+    total = len(parts)
+    result = []
+    for n, chunk in enumerate(parts, 1):
+        shown = title if total == 1 else f"{title} ({n}/{total})"
+        body = "\n".join(_item_line(i) for i in chunk)
+        result.append(Section(f"{title}#{n}", shown, category, chunk,
+                              f"<b>{html.escape(shown, quote=False)}</b>\n{body}"))
+    return result
+
+
+def build_sections(text: str):
+    """Прайс -> (список разделов для постов канала, BuildResult с отчётом)."""
+    result, by_category = _collect(text)
+    sections = []
+    for category in CATEGORY_ORDER:
+        groups = by_category.get(category)
+        if not groups:
+            continue
+        if category == "iPhone":
+            for group in sorted(groups, key=_iphone_sort_key):
+                sections += _pack(group, category, groups[group])
+            continue
+        items = [it for g in groups.values() for it in g]
+        series_of = SERIES_FUNCS.get(category)
+        if series_of is None:
+            sections += _pack(category, category, items)
+            continue
+        by_series = {}  # Samsung и Galaxy всегда делятся по сериям, чтобы названия постов не менялись
+        for it in items:
+            by_series.setdefault(series_of(it.name), []).append(it)
+        for series in sorted(by_series):
+            sections += _pack(series, category, by_series[series])
+    result.kept = sum(len(sec.items) for sec in sections)
+    return sections, result
