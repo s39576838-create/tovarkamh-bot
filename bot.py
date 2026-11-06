@@ -358,8 +358,7 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("Отменено. Ничего не изменено.")
         return
 
-    pending.pop(token, None)
-    await query.edit_message_text("⏳ Обновляю каталог в канале…")
+    await query.edit_message_text("⏳ Обновляю каталог в канале… Это займёт минуту: Telegram ограничивает скорость публикации.")
     async with _publish_lock:
         state = await get_state(context)
         try:
@@ -379,10 +378,17 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"✅ Каталог в {CHANNEL} обновлён.\n"
         f"Обновлено постов: {rep['updated']}, создано: {rep['created']}, «нет в наличии»: {rep['absent']}."
     )
+    retry_markup = None
     if rep["errors"]:
         shown = "\n".join(f"  • {e}" for e in rep["errors"][:8])
-        text += f"\n\n⚠️ Не удалось ({len(rep['errors'])}):\n{shown}"
-    await query.edit_message_text(text)
+        text += (
+            f"\n\n⚠️ Не удалось ({len(rep['errors'])}):\n{shown}\n"
+            "Нажмите «Повторить»: бот доделает только недостающее."
+        )
+        retry_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Повторить", callback_data=f"pub:{token}")]])
+    else:
+        pending.pop(token, None)
+    await query.edit_message_text(text, reply_markup=retry_markup)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -398,7 +404,11 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder().token(BOT_TOKEN)
+        .connect_timeout(15).read_timeout(30).write_timeout(30).pool_timeout(15)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("reset", cmd_reset))
