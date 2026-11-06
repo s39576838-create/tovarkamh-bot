@@ -22,6 +22,14 @@ CATEGORY_ORDER = [
     "iPhone", "iPad", "AirPods", "Apple Watch", "MacBook",
     "Samsung", "Galaxy",
     "Dyson", "PlayStation", "Marshall", "Canon", "Ray-Ban",
+    "Блоки питания", "Кабели",
+]
+
+# Дополнительные категории по ключевым словам в названии (проверяются после всех брендов).
+# Чтобы добавить новую: допишите строку сюда и название в CATEGORY_ORDER выше.
+EXTRA_CATEGORIES = [
+    ("Блоки питания", r"блок\s+питани|адаптер|зарядн|power\s*adapter|charger|\bmagsafe\b|\bpd\s?\d{2,3}\s?w|\b\d{2,3}\s?w\b"),
+    ("Кабели", r"кабел|провод|\bcable\b|шнур|\blightning\b|\busb[-\s]?c\b.*\bto\b"),
 ]
 
 # ---------- Фильтры ----------
@@ -93,6 +101,9 @@ def iphone_group(name: str) -> str:
     m = re.search(r"iphone\s*(\d{1,2}e?)(?!\d)", name, re.IGNORECASE)
     if m:
         return f"iPhone {m.group(1).lower()}"
+    m = re.search(r"iphone\s*duo\b", name, re.IGNORECASE)
+    if m:
+        return "iPhone Duo"
     m = re.search(r"iphone\s*(se|air)\b", name, re.IGNORECASE)
     if m:
         return f"iPhone {m.group(1).upper() if m.group(1).lower() == 'se' else 'Air'}"
@@ -107,7 +118,7 @@ def _iphone_sort_key(group: str):
     m = re.match(r"(\d+)(e?)$", tail)
     if m:
         return (int(m.group(1)), m.group(2))
-    return ({"se": 9, "x": 10, "air": 18}.get(tail, 0), "")
+    return ({"se": 9, "x": 10, "air": 18, "duo": 19}.get(tail, 0), "")
 
 
 def classify(name: str):
@@ -150,6 +161,9 @@ def classify(name: str):
         return "Ray-Ban", "Ray-Ban"
     if re.match(r"\s*watch\b", low):
         return "Apple Watch", "Apple Watch"
+    for extra, pattern in EXTRA_CATEGORIES:
+        if re.search(pattern, low):
+            return extra, extra
     return None, None
 
 
@@ -162,7 +176,7 @@ def _collect(text: str):
     for raw_line in text.splitlines():
         if not re.match(r"^\s*▫", raw_line):
             continue
-        line = raw_line.strip()
+        line = raw_line.strip().replace("`", "")  # поставщик иногда оформляет строки как код
 
         m = LINE_RE.match(line)
         if not m:
