@@ -1,9 +1,10 @@
 """Telegram-бот для канала @tovarkamh.
 
-1. Вы отправляете боту пост поставщика -> бот собирает готовый пост (правила в catalog.py),
-   показывает предпросмотр и после нажатия «Опубликовать» выкладывает его в канал.
-2. Под постом одна кнопка «Заказать». Клиент нажимает её, открывается чат с ботом, и бот
-   сразу пишет всем менеджерам. Первый, кто нажал «Беру», забирает заказ, остальные получают уведомление.
+1. Вы отправляете боту полный прайс поставщика -> бот собирает разделы (правила в catalog.py),
+   показывает, что будет обновлено, и после «Опубликовать» редактирует посты в канале
+   (меню «Каталог» с кнопками-категориями + по посту на раздел; новые сообщения не плодятся).
+2. Под каждым постом кнопка «Заказать»: клиент нажимает её прямо в канале, бот сразу пишет
+   всем менеджерам. Первый, кто нажал «Беру», забирает заказ, остальные получают уведомление.
 """
 
 import asyncio
@@ -27,7 +28,8 @@ from telegram.ext import (
     filters,
 )
 
-from catalog import build_post, split_for_telegram
+import channel as channel_mod
+from catalog import build_sections
 
 load_dotenv(Path(__file__).with_name("config.env"))
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -55,7 +57,8 @@ NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 MAX_PENDING = 20   # сколько подготовленных постов держим в памяти
 MAX_ORDERS = 300   # сколько последних заказов помним для кнопки «Беру»
 
-_take_lock = asyncio.Lock()  # чтобы два менеджера не забрали один заказ одновременно
+_take_lock = asyncio.Lock()
+_publish_lock = asyncio.Lock()  # чтобы два менеджера не забрали один заказ одновременно
 
 
 def order_keyboard(bot_username: str = "") -> InlineKeyboardMarkup:
@@ -83,7 +86,7 @@ def make_report(res, limit: int = 12) -> str:
         more = f"\n  … и ещё {len(rows) - limit}" if len(rows) > limit else ""
         return f"\n\n{title} ({len(rows)}):\n{shown}{more}"
 
-    text = f"В пост попало товаров: {res.kept}"
+    text = f"В каталог попало товаров: {res.kept}"
     text += section("Исключено по правилам", [f"{line}  [{why}]" for line, why in res.excluded])
     text += section("Не прочитана цена", res.unparsed)
     text += section("Бренд не из вашего списка", res.unmatched)
@@ -103,7 +106,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Привет! Перешлите мне пост поставщика (или вставьте его текст).\n"
             "Я отфильтрую товары, посчитаю цены и покажу готовый пост. "
             f"После вашего подтверждения опубликую его в {CHANNEL}.\n\n"
-            "/id — показать ваш Telegram ID"
+            "/id — показать ваш Telegram ID\n"
+            "/reset — забыть посты каталога в канале (создать заново)"
         )
         if user_id in MANAGER_IDS:
             text += "\n\nВы также получаете сюда заказы от клиентов."
@@ -251,6 +255,34 @@ async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────── публикация прайса ───────────────────────────
+async def get_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Состояние каталога: из памяти, из файла или (если файл пропал) из закреплённого меню."""
+    state = context.bot_data.get("state")
+    if state is None:
+        state = channel_mod.load_state()
+        if channel_mod.is_empty(state):
+            state = await channel_mod.recover_state(context.bot, CHANNEL)
+            if not channel_mod.is_empty(state):
+                channel_mod.save_state(state)
+        context.bot_data["state"] = state
+    return state
+
+
+def plan_text(sections, plan, state) -> str:
+    def line(sec):
+        return f"  • {sec.title} — {len(sec.items)} шт."
+
+    text = f"Разделов в каталоге: {len(sections)}"
+    if plan["update"]:
+        text += f"\n\n🔄 Обновлю посты ({len(plan['update'])}):\n" + "\n".join(line(x) for x in plan["update"])
+    if plan["create"]:
+        text += f"\n\n🆕 Создам новые посты ({len(plan['create'])}):\n" + "\n".join(line(x) for x in plan["create"])
+    if plan["absent"]:
+        names = [state["sections"][k].get("title", k) for k in plan["absent"]]
+        text += f"\n\n🚫 Помечу «Нет в наличии» ({len(names)}):\n" + "\n".join(f"  • {n}" for n in names)
+    return text
+
+
 async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not ADMIN_IDS:
@@ -268,31 +300,27 @@ async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await msg.reply_text("Не вижу строк с маркером ▫️. Пришлите пост поставщика целиком.")
         return
 
-    res = build_post(text)
-    chunks = split_for_telegram(res.blocks)
-    if not chunks:
+    sections, res = build_sections(text)
+    if not sections:
         await msg.reply_text("Подходящих товаров не нашлось." + make_report(res))
         return
 
-    # Предпросмотр: ровно то, что уйдёт в канал.
-    await msg.reply_text("👇 Так будет выглядеть пост:")
-    for i, chunk in enumerate(chunks):
-        last = i == len(chunks) - 1
-        await msg.reply_text(
-            chunk,
-            parse_mode=ParseMode.HTML,
-            link_preview_options=NO_PREVIEW,
-            reply_markup=order_keyboard(context.bot.username) if last else None,
-        )
+    state = await get_state(context)
+    plan = channel_mod.make_plan(sections, state)
 
     pending: dict = context.bot_data.setdefault("pending", {})
     while len(pending) >= MAX_PENDING:
         pending.pop(next(iter(pending)))
     token = secrets.token_hex(4)
-    pending[token] = chunks
+    pending[token] = sections
 
+    first = (
+        "\n\nℹ️ Меню в канале ещё не создано: бот выложит меню «Каталог», закрепит его и создаст посты."
+        if not state.get("menu_id") else ""
+    )
     await msg.reply_text(
-        make_report(res) + f"\n\nОпубликовать в {CHANNEL}?",
+        plan_text(sections, plan, state) + first + "\n\n" + make_report(res)
+        + f"\n\nОбновить каталог в {CHANNEL}?",
         reply_markup=InlineKeyboardMarkup(
             [[
                 InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub:{token}"),
@@ -310,45 +338,61 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     action, _, token = (query.data or "").partition(":")
     pending: dict = context.bot_data.setdefault("pending", {})
-    chunks = pending.get(token)
-    if chunks is None:
-        await query.edit_message_text("Этот пост уже обработан, или бот перезапускался. Пришлите прайс заново.")
+    sections = pending.get(token)
+    if sections is None:
+        await query.edit_message_text("Этот прайс уже обработан, или бот перезапускался. Пришлите прайс заново.")
         return
 
     if action == "cancel":
         pending.pop(token, None)
-        await query.edit_message_text("Отменено. Ничего не опубликовано.")
-        return
-
-    sent = 0
-    try:
-        for i, chunk in enumerate(chunks):
-            last = i == len(chunks) - 1
-            await context.bot.send_message(
-                chat_id=CHANNEL,
-                text=chunk,
-                parse_mode=ParseMode.HTML,
-                link_preview_options=NO_PREVIEW,
-                reply_markup=order_keyboard(context.bot.username) if last else None,
-            )
-            sent += 1
-    except TelegramError as exc:
-        log.exception("Не удалось опубликовать")
-        extra = f" Уже отправлено частей: {sent} из {len(chunks)}." if sent else ""
-        await query.edit_message_text(
-            f"❌ Не получилось опубликовать: {exc}.{extra}\n"
-            f"Проверьте, что бот добавлен администратором в {CHANNEL} с правом публиковать сообщения."
-        )
+        await query.edit_message_text("Отменено. Ничего не изменено.")
         return
 
     pending.pop(token, None)
-    await query.edit_message_text(f"✅ Опубликовано в {CHANNEL} (сообщений: {sent}).")
+    await query.edit_message_text("⏳ Обновляю каталог в канале…")
+    async with _publish_lock:
+        state = await get_state(context)
+        try:
+            rep = await channel_mod.publish(
+                context.bot, CHANNEL, sections, order_keyboard(context.bot.username), state
+            )
+        except TelegramError as exc:
+            log.exception("Не удалось обновить каталог")
+            await query.edit_message_text(
+                f"❌ Не получилось обновить каталог: {exc}\n"
+                f"Проверьте, что бот администратор {CHANNEL} с правом публиковать и редактировать сообщения."
+            )
+            return
+
+    text = (
+        f"✅ Каталог в {CHANNEL} обновлён.\n"
+        f"Обновлено постов: {rep['updated']}, создано: {rep['created']}, «нет в наличии»: {rep['absent']}."
+    )
+    if rep["pinned"] is False:
+        text += "\n⚠️ Меню не удалось закрепить: дайте боту право «Закреплять сообщения» и закрепите его вручную."
+    if rep["errors"]:
+        shown = "\n".join(f"  • {e}" for e in rep["errors"][:8])
+        text += f"\n\n⚠️ Не удалось ({len(rep['errors'])}):\n{shown}"
+    await query.edit_message_text(text)
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Забыть созданные посты: следующая публикация создаст каталог с нуля."""
+    if not is_admin(update):
+        return
+    channel_mod.reset_state()
+    context.bot_data["state"] = {"menu_id": None, "sections": {}}
+    await update.message.reply_text(
+        "Бот забыл свои посты в канале. Удалите старые сообщения в канале вручную, "
+        "затем пришлите прайс: каталог будет создан заново."
+    )
 
 
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CallbackQueryHandler(on_order_button, pattern=r"^order$"))
     app.add_handler(CallbackQueryHandler(on_take, pattern=r"^take:"))
     app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^(pub|cancel):"))
