@@ -1,9 +1,10 @@
 """Публикация каталога в канал: меню с кнопками-категориями и по одному посту на раздел.
 
 Новые прайсы не создают новых сообщений, а редактируют уже опубликованные посты.
-Какой пост к какому разделу относится, бот хранит в state.json. Если файл пропал
-(например, хостинг пересобрал контейнер), состояние восстанавливается по закреплённому
-меню: в его кнопках лежат ссылки на посты.
+Какой пост к какому разделу относится, бот хранит в state.json, а копию — в закреплённом
+служебном сообщении в личном чате администратора с ботом. Если файл пропал (например,
+хостинг пересобрал контейнер), состояние восстанавливается из этой копии.
+Меню «Каталог» после каждого обновления пересоздаётся и всегда остаётся последним в канале.
 """
 import json
 import logging
@@ -80,8 +81,64 @@ def key_from_title(title: str) -> str:
     return f"{m.group('base')}#{m.group('n') or 1}"
 
 
+BACKUP_HEAD = "🗄 Служебное сообщение бота: список постов каталога. Не удаляйте.\n"
+
+
+def _backup_text(state: dict):
+    data = {
+        "m": state.get("menu_id"),
+        "s": {k: [v["message_id"], v.get("title", k), v.get("category", "")] for k, v in state["sections"].items()},
+    }
+    text = BACKUP_HEAD + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return text if len(text) <= 4000 else None
+
+
+async def backup_state(bot, chat_id, state: dict) -> None:
+    """Копия состояния в закреплённом сообщении личного чата администратора."""
+    text = _backup_text(state)
+    if text is None:
+        log.warning("Состояние слишком большое для копии в чате")
+        return
+    try:
+        if state.get("backup_id"):
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=state["backup_id"], text=text)
+                return
+            except BadRequest as exc:
+                if "not modified" in str(exc).lower():
+                    return
+                if not ("not found" in str(exc).lower() or "can't be edited" in str(exc).lower()):
+                    raise
+        sent = await bot.send_message(chat_id=chat_id, text=text, disable_notification=True)
+        state["backup_id"] = sent.message_id
+        save_state(state)
+        await bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=True)
+    except TelegramError as exc:
+        log.warning("Не удалось сохранить копию состояния в чате %s: %s", chat_id, exc)
+
+
+async def recover_from_backup(bot, chat_ids) -> dict:
+    for chat_id in chat_ids:
+        try:
+            chat = await bot.get_chat(chat_id)
+        except TelegramError:
+            continue
+        pinned = getattr(chat, "pinned_message", None)
+        text = (getattr(pinned, "text", None) or "") if pinned else ""
+        if not text.startswith(BACKUP_HEAD):
+            continue
+        try:
+            data = json.loads(text[len(BACKUP_HEAD):])
+            sections = {k: {"message_id": v[0], "title": v[1], "category": v[2]} for k, v in data["s"].items()}
+        except (ValueError, KeyError, IndexError, TypeError):
+            continue
+        log.info("Состояние восстановлено из копии в чате %s: разделов %d", chat_id, len(sections))
+        return {"menu_id": data.get("m"), "sections": sections, "backup_id": pinned.message_id}
+    return {"menu_id": None, "sections": {}}
+
+
 async def recover_state(bot, channel: str) -> dict:
-    """Восстанавливает состояние по закреплённому меню канала."""
+    """Запасной вариант: восстановление по закреплённому меню канала (старые версии)."""
     state = {"menu_id": None, "sections": {}}
     try:
         chat = await bot.get_chat(channel)
@@ -170,9 +227,9 @@ def _menu_markup(channel: str, state: dict, absent: set) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(rows)
 
 
-async def publish(bot, channel: str, sections, order_markup, state: dict) -> dict:
+async def publish(bot, channel: str, sections, order_markup, state: dict, backup_chat=None) -> dict:
     """Обновляет посты и меню. Возвращает отчёт: сколько обновлено/создано/нет в наличии."""
-    report = {"updated": 0, "created": 0, "absent": 0, "pinned": None, "errors": []}
+    report = {"updated": 0, "created": 0, "absent": 0, "errors": []}
     known = state["sections"]
     plan = make_plan(sections, state)
     stamp_line = f"\n\n<i>Обновлено {stamp()}</i>"
@@ -199,20 +256,23 @@ async def publish(bot, channel: str, sections, order_markup, state: dict) -> dic
 
     absent = set(plan["absent"])
     menu_text = f"{MENU_TITLE}\nВыберите категорию 👇\n\n<i>Цены и наличие обновлены {stamp()}</i>"
-    first_menu = not state.get("menu_id")
+    old_menu = state.get("menu_id")
     try:
-        state["menu_id"] = await _upsert(
-            bot, channel, state.get("menu_id"), menu_text, _menu_markup(channel, state, absent)
+        sent = await bot.send_message(
+            chat_id=channel, text=menu_text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+            reply_markup=_menu_markup(channel, state, absent), disable_notification=True,
         )
     except TelegramError as exc:
         report["errors"].append(f"меню: {exc}")
     else:
+        state["menu_id"] = sent.message_id
         save_state(state)
-        if first_menu:
+        if old_menu:  # старое меню убираем, чтобы новое всегда было в самом низу
             try:
-                await bot.pin_chat_message(chat_id=channel, message_id=state["menu_id"], disable_notification=True)
-                report["pinned"] = True
+                await bot.delete_message(chat_id=channel, message_id=old_menu)
             except TelegramError as exc:
-                report["pinned"] = False
-                log.warning("Не удалось закрепить меню: %s", exc)
+                log.warning("Не удалось удалить старое меню %s: %s", old_menu, exc)
+                report["errors"].append("старое меню не удалилось (удалите его вручную)")
+    if backup_chat:
+        await backup_state(bot, backup_chat, state)
     return report
