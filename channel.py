@@ -242,7 +242,7 @@ async def _upsert(bot, channel, message_id, text, markup):
             log.warning("Сообщение %s не найдено, отправляю новое: %s", message_id, exc)
     sent = await _retry(lambda: bot.send_message(
         chat_id=channel, text=text, parse_mode=ParseMode.HTML,
-        link_preview_options=NO_PREVIEW, reply_markup=markup,
+        link_preview_options=NO_PREVIEW, reply_markup=markup, disable_notification=True,
     ))
     await asyncio.sleep(PACE)
     return sent.message_id
@@ -261,16 +261,21 @@ def _menu_markup(channel: str, state: dict, absent: set = frozenset()) -> Inline
     return InlineKeyboardMarkup(rows)
 
 
-def _post_markup(order_markup, menu_url, with_order=True):
-    """Кнопки под постом: «Заказать» (если товар есть) и «К меню»."""
-    rows = list(order_markup.inline_keyboard) if with_order else []
+def _post_markup(key, menu_url, with_order=True):
+    """Кнопки под постом: «Заказать» (если товар есть; в нажатии зашит раздел) и «К меню»."""
+    rows = []
+    if with_order:
+        data = f"order:{key}"
+        if len(data.encode("utf-8")) > 64:
+            data = "order"
+        rows.append([InlineKeyboardButton("Заказать", callback_data=data)])
     if menu_url:
         rows.append([InlineKeyboardButton("⬅️ К меню", url=menu_url)])
     return InlineKeyboardMarkup(rows) if rows else None
 
 
 async def publish(bot, channel: str, sections, order_markup, state: dict, backup_chat=None,
-                  mark_absent: bool = False) -> dict:
+                  mark_absent: bool = False, absent_keys=()) -> dict:
     """Обновляет посты и меню.
 
     sections — разделы из присланного сообщения (это может быть часть прайса). Остальные посты не меняются,
@@ -284,9 +289,11 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
     report = {"updated": 0, "created": 0, "absent": 0, "errors": []}
     known = state["sections"]
     plan = make_plan(sections, state, mark_absent)
+    for key in absent_keys:  # разделы, которые нужно пометить «нет в наличии» вручную
+        if key in known and not known[key].get("absent") and key not in plan["absent"]:
+            plan["absent"].append(key)
     stamp_line = f"\n\n<i>Обновлено {stamp()}</i>"
     absent_now = set(plan["absent"])
-    in_message = {s.key for s in sections}
     menu_url = lambda: message_url(channel, state["menu_id"]) if state.get("menu_id") else None  # noqa: E731
 
     async def send_menu() -> bool:
@@ -313,7 +320,7 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
 
     async def set_markup(key: str) -> None:
         entry = known[key]
-        markup = _post_markup(order_markup, menu_url(), with_order=not entry.get("absent"))
+        markup = _post_markup(key, menu_url(), with_order=not entry.get("absent"))
         try:
             await _retry(lambda: bot.edit_message_reply_markup(
                 chat_id=channel, message_id=entry["message_id"], reply_markup=markup))
@@ -329,7 +336,7 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
         if sec.key in known:
             continue
         try:
-            mid = await _upsert(bot, channel, None, sec.text + stamp_line, _post_markup(order_markup, menu_url()))
+            mid = await _upsert(bot, channel, None, sec.text + stamp_line, _post_markup(sec.key, menu_url()))
         except TelegramError as exc:
             report["errors"].append(f"{sec.title}: {exc}")
             continue
@@ -350,7 +357,7 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
         entry.update(title=sec.title, category=sec.category, absent=False)
         try:
             mid = await _upsert(bot, channel, entry["message_id"], sec.text + stamp_line,
-                                _post_markup(order_markup, menu_url()))
+                                _post_markup(sec.key, menu_url()))
         except TelegramError as exc:
             report["errors"].append(f"{sec.title}: {exc}")
             continue
@@ -368,7 +375,7 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
         entry["absent"] = True
         text = f"<b>{entry['title']}</b>\n\nНет в наличии.{stamp_line}"
         try:
-            await _upsert(bot, channel, entry["message_id"], text, _post_markup(order_markup, menu_url(), False))
+            await _upsert(bot, channel, entry["message_id"], text, _post_markup(key, menu_url(), False))
             report["absent"] += 1
         except TelegramError as exc:
             report["errors"].append(f"{entry['title']}: {exc}")
@@ -388,3 +395,19 @@ async def publish(bot, channel: str, sections, order_markup, state: dict, backup
     if backup_chat:
         await backup_state(bot, backup_chat, state)
     return report
+
+
+async def notify_update(bot, channel: str, state: dict, text: str, backup_chat=None) -> dict:
+    """Ручное уведомление подписчикам (со звуком). После него меню снова отправляется последним,
+    а у постов обновляется ссылка «К меню»."""
+    if state.get("notice_id"):  # прошлое уведомление убираем, чтобы они не копились
+        try:
+            await _retry(lambda: bot.delete_message(chat_id=channel, message_id=state["notice_id"]))
+        except TelegramError:
+            pass
+    sent = await _retry(lambda: bot.send_message(
+        chat_id=channel, text=text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW))
+    state["notice_id"] = sent.message_id
+    save_state(state)
+    await asyncio.sleep(PACE)
+    return await publish(bot, channel, [], None, state, backup_chat=backup_chat)
