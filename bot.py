@@ -31,6 +31,9 @@ from catalog import build_post, split_for_telegram
 
 load_dotenv(Path(__file__).with_name("config.env"))
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+# httpx пишет в лог полный адрес запроса вместе с токеном бота — глушим
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("tovarkamh_bot")
 
 
