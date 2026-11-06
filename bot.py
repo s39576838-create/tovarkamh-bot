@@ -205,14 +205,14 @@ async def on_order_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Клиент нажал «Заказать» под постом в канале: ответ всплывает прямо там."""
     query = update.callback_query
     status = await create_order(context, update.effective_user)
-    await query.answer(REPLIES[status], show_alert=True)
+    await safe_answer(query, REPLIES[status], show_alert=True)
 
 
 async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Менеджер нажал «Беру»."""
     query, user = update.callback_query, update.effective_user
     if user.id not in MANAGER_IDS:
-        await query.answer("Нет доступа", show_alert=True)
+        await safe_answer(query, "Нет доступа", show_alert=True)
         return
 
     order_id = (query.data or "").partition(":")[2]
@@ -221,7 +221,7 @@ async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with _take_lock:  # внутри блока заказ может забрать только один человек
         order = orders.get(order_id)
         if order is None:
-            await query.answer(
+            await safe_answer(query, 
                 "Заказ устарел: бот перезапускался. Решите между собой, кто пишет клиенту.", show_alert=True
             )
             try:
@@ -231,7 +231,7 @@ async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         if order["taken_by"] is not None:
             taker = order["taken_by_name"]
-            await query.answer(f"Заказ уже взял {taker}", show_alert=True)
+            await safe_answer(query, f"Заказ уже взял {taker}", show_alert=True)
             try:
                 await query.edit_message_text(
                     order_text(order, f"✅ Заказ взял: {html.escape(taker)}"), parse_mode=ParseMode.HTML
@@ -242,7 +242,7 @@ async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         order["taken_by"] = user.id
         order["taken_by_name"] = person_name(user)
 
-    await query.answer("Вы взяли заказ")
+    await safe_answer(query, "Вы взяли заказ")
     taker = html.escape(order["taken_by_name"])
     for manager_id, message_id in order["messages"].items():
         status = "✅ <b>Вы взяли этот заказ.</b> Напишите клиенту." if manager_id == user.id else f"✅ Заказ взял: {taker}"
@@ -255,13 +255,23 @@ async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────── публикация прайса ───────────────────────────
+async def safe_answer(query, text=None, **kw) -> None:
+    """Ответ на нажатие кнопки; если нажатие слишком старое, Telegram откажет — это не страшно."""
+    try:
+        await query.answer(text, **kw)
+    except TelegramError as exc:
+        log.warning("Не удалось ответить на нажатие кнопки: %s", exc)
+
+
 async def get_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
     """Состояние каталога: из памяти, из файла или (если файл пропал) из закреплённого меню."""
     state = context.bot_data.get("state")
     if state is None:
         state = channel_mod.load_state()
         if channel_mod.is_empty(state):
-            state = await channel_mod.recover_state(context.bot, CHANNEL)
+            state = await channel_mod.recover_from_backup(context.bot, sorted(ADMIN_IDS))
+            if channel_mod.is_empty(state):
+                state = await channel_mod.recover_state(context.bot, CHANNEL)
             if not channel_mod.is_empty(state):
                 channel_mod.save_state(state)
         context.bot_data["state"] = state
@@ -315,7 +325,7 @@ async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     pending[token] = sections
 
     first = (
-        "\n\nℹ️ Меню в канале ещё не создано: бот выложит меню «Каталог», закрепит его и создаст посты."
+        "\n\nℹ️ Каталога в канале ещё нет: бот создаст посты и меню «Каталог» (оно всегда будет последним сообщением)."
         if not state.get("menu_id") else ""
     )
     await msg.reply_text(
@@ -332,7 +342,7 @@ async def on_price_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await safe_answer(query)
     if not is_admin(update):
         return
 
@@ -354,7 +364,8 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         state = await get_state(context)
         try:
             rep = await channel_mod.publish(
-                context.bot, CHANNEL, sections, order_keyboard(context.bot.username), state
+                context.bot, CHANNEL, sections, order_keyboard(context.bot.username), state,
+                backup_chat=update.effective_user.id,
             )
         except TelegramError as exc:
             log.exception("Не удалось обновить каталог")
@@ -368,8 +379,6 @@ async def on_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"✅ Каталог в {CHANNEL} обновлён.\n"
         f"Обновлено постов: {rep['updated']}, создано: {rep['created']}, «нет в наличии»: {rep['absent']}."
     )
-    if rep["pinned"] is False:
-        text += "\n⚠️ Меню не удалось закрепить: дайте боту право «Закреплять сообщения» и закрепите его вручную."
     if rep["errors"]:
         shown = "\n".join(f"  • {e}" for e in rep["errors"][:8])
         text += f"\n\n⚠️ Не удалось ({len(rep['errors'])}):\n{shown}"
