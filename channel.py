@@ -257,6 +257,9 @@ def _menu_markup(channel: str, state: dict, absent: set = frozenset()) -> Inline
     for _, title, key, mid in entries:
         label = title + (ABSENT_MARK if key in absent or state["sections"][key].get("absent") else "")
         buttons.append(InlineKeyboardButton(label, url=message_url(channel, mid)))
+    extra = state.get("extra")  # раздел «Разное» с товарами из учёта (его ведёт showcase.py)
+    if extra and extra.get("hub"):
+        buttons.append(InlineKeyboardButton(extra.get("title") or "Разное", url=message_url(channel, int(extra["hub"]))))
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
 
