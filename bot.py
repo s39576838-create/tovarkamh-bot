@@ -15,6 +15,7 @@ import os
 import secrets
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
@@ -30,6 +31,7 @@ from telegram.ext import (
 )
 
 import channel as channel_mod
+import showcase
 from catalog import build_sections
 
 load_dotenv(Path(__file__).with_name("config.env"))
@@ -131,23 +133,28 @@ def order_text(order: dict, status: str = "") -> str:
     if order["username"]:
         who += f' (@{html.escape(order["username"])})'
     lines = ["🛒 <b>Новый заказ</b>", f"Клиент: {who}"]
+    if order.get("item"):
+        lines.append(f"Товар: <b>{html.escape(order['item'])}</b>")
     if order.get("section"):
         lines.append(f"Раздел: <b>{html.escape(order['section'])}</b>")
     lines.append(status or "Нажмите «Беру», чтобы забрать заказ.")
     return "\n".join(lines)
 
 
-async def create_order(context: ContextTypes.DEFAULT_TYPE, user, section_key=None) -> str:
-    """Создаёт заказ и пишет менеджерам. Возвращает: ok | repeat | fail | unavailable."""
+async def create_order(context: ContextTypes.DEFAULT_TYPE, user, section_key=None, item=None) -> str:
+    """Создаёт заказ и пишет менеджерам. Возвращает: ok | repeat | fail | unavailable.
+
+    item — название товара из карточки раздела «Разное»: повтор считается отдельно по каждому товару."""
     if not MANAGER_IDS:
         log.error("Не заданы MANAGER_IDS/ADMIN_IDS: некому отправлять заказы")
         return "unavailable"
 
     last_at: dict = context.bot_data.setdefault("last_order_at", {})
     now = time.time()
-    if now - last_at.get(user.id, 0) < ORDER_COOLDOWN:
+    cool_key = (user.id, item) if item else user.id  # как раньше: один клиент — одна заявка в 2 минуты; карточки считаются по товару
+    if now - last_at.get(cool_key, 0) < ORDER_COOLDOWN:
         return "repeat"
-    last_at[user.id] = now
+    last_at[cool_key] = now
 
     order_id = secrets.token_hex(4)
     order = {
@@ -155,6 +162,7 @@ async def create_order(context: ContextTypes.DEFAULT_TYPE, user, section_key=Non
         "name": user.full_name or user.username or str(user.id),
         "username": user.username,
         "section": None,
+        "item": item,
         "taken_by": None,
         "taken_by_name": "",
         "messages": {},  # id менеджера -> id сообщения с уведомлением
@@ -177,7 +185,7 @@ async def create_order(context: ContextTypes.DEFAULT_TYPE, user, section_key=Non
             failed.append(manager_id)
 
     if not order["messages"]:
-        last_at.pop(user.id, None)
+        last_at.pop(cool_key, None)
         return "fail"
 
     orders: dict = context.bot_data.setdefault("orders", {})
@@ -211,11 +219,22 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(REPLIES[status])
 
 
+def card_label(message) -> str:
+    """Название и цена товара из подписи карточки в канале («Отвёртка — 500₽»)."""
+    text = (getattr(message, "caption", None) or getattr(message, "text", None) or "").strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " — ".join(lines[:2])
+
+
 async def on_order_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Клиент нажал «Заказать» под постом в канале: ответ всплывает прямо там."""
     query = update.callback_query
     _, _, section_key = (query.data or "").partition(":")
-    status = await create_order(context, update.effective_user, section_key or None)
+    if section_key == "c":  # карточка товара из раздела «Разное»: название берём из её подписи
+        item = card_label(query.message) or "товар из раздела «Разное»"
+        status = await create_order(context, update.effective_user, item=item)
+    else:
+        status = await create_order(context, update.effective_user, section_key or None)
     await safe_answer(query, REPLIES[status], show_alert=True)
 
 
@@ -517,10 +536,70 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ─────────────────────────── раздел «Разное» (товары из учёта) ───────────────────────────
+async def showcase_tick(ctx) -> None:
+    """Один опрос учёта: обновляет кнопку раздела в меню и возвращает меню в самый низ канала."""
+    info = await showcase.fetch_info()
+    if info is None:
+        log.warning("Раздел «Разное»: учёт не принял SYNC_KEY")
+        return
+    state = await get_state(ctx)
+    extra, changed, refresh = showcase.decide(info, state)
+    if not state.get("menu_id"):  # каталога в канале ещё нет: кнопка раздела появится при первой публикации
+        if changed:
+            state["extra"] = extra
+            channel_mod.save_state(state)
+        return
+    if not refresh:
+        return
+
+    async with _publish_lock:
+        state = await get_state(ctx)
+        before_menu, before_extra = state.get("menu_id"), state.get("extra")
+        state["extra"] = extra
+        backup_chat = min(ADMIN_IDS) if ADMIN_IDS else None
+        try:
+            await channel_mod.publish(ctx.bot, CHANNEL, [], None, state, backup_chat=backup_chat)
+        except Exception:
+            state["extra"] = before_extra  # меню не обновилось: при следующем опросе попробуем снова
+            raise
+        if state.get("menu_id") == before_menu:  # публикация не упала, но новое меню не отправилось
+            state["extra"] = before_extra
+            ctx.bot_data["showcase_retry_at"] = time.time() + showcase.RETRY_AFTER_FAIL
+            log.warning("Раздел «Разное»: меню отправить не удалось, повторю позже")
+            return
+        channel_mod.save_state(state)
+    log.info("Раздел «Разное»: меню обновлено")
+
+
+async def showcase_loop(app: Application) -> None:
+    ctx = SimpleNamespace(bot_data=app.bot_data, bot=app.bot)  # get_state нужны только эти два поля
+    while True:
+        await asyncio.sleep(showcase.SYNC_EVERY)
+        if time.time() < app.bot_data.get("showcase_retry_at", 0):
+            continue
+        try:
+            await showcase_tick(ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # адрес с ключом в журнал не пишем, только тип ошибки
+            log.warning("Раздел «Разное»: сбой синхронизации (%s)", type(exc).__name__)
+            app.bot_data["showcase_retry_at"] = time.time() + showcase.RETRY_AFTER_FAIL
+
+
+async def on_startup(app: Application) -> None:
+    if showcase.enabled():
+        app.bot_data["showcase_task"] = asyncio.create_task(showcase_loop(app))
+        log.info("Раздел «Разное»: слежу за учётом каждые %d с", showcase.SYNC_EVERY)
+    else:
+        log.info("Раздел «Разное» выключен: не заданы SYNC_URL и SYNC_KEY")
+
+
 def build_app() -> Application:
     app = (
         Application.builder().token(BOT_TOKEN)
         .connect_timeout(15).read_timeout(30).write_timeout(30).pool_timeout(15)
+        .post_init(on_startup)
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
