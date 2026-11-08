@@ -18,7 +18,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, LinkPreviewOptions, Update
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, LinkPreviewOptions,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -26,6 +29,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ApplicationHandlerStop,
     MessageHandler,
     filters,
 )
@@ -196,6 +200,7 @@ async def create_order(context: ContextTypes.DEFAULT_TYPE, user, section_key=Non
     while len(orders) >= MAX_ORDERS:
         orders.pop(next(iter(orders)))
     orders[order_id] = order
+    context.bot_data.setdefault("phone_wait", {})[user.id] = {"order_id": order_id, "item": item, "until": now + PHONE_WAIT}
 
     for manager_id in failed:  # предупредим тех, кому доставилось
         for reachable in order["messages"]:
@@ -207,6 +212,78 @@ async def create_order(context: ContextTypes.DEFAULT_TYPE, user, section_key=Non
             except TelegramError:
                 pass
     return "ok"
+
+
+# ─────────────────────────── телефон клиента ───────────────────────────
+PHONE_WAIT = 3600  # сколько клиент может прислать номер после заказа, секунд
+PHONE_SKIP = "Не нужно"
+PHONE_RE = re.compile(r"^\+?[\d\s().-]{10,20}$")
+
+
+def parse_phone(text: str):
+    """Номер из текста («+7 900 123-45-67», «89001234567») или None, если это не телефон."""
+    text = (text or "").strip()
+    if not PHONE_RE.match(text):
+        return None
+    digits = re.sub(r"\D", "", text)
+    if not 10 <= len(digits) <= 15:
+        return None
+    return ("+" + digits) if text.startswith("+") else digits
+
+
+async def ask_phone(context: ContextTypes.DEFAULT_TYPE, user) -> None:
+    """После заказа предлагает клиенту оставить телефон. Если бот не может ему написать (клиент не нажимал
+    «Старт»), тихо пропускаем: заказ уже у менеджеров."""
+    if user.id not in (context.bot_data.get("phone_wait") or {}):
+        return
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Поделиться номером", request_contact=True)], [KeyboardButton(PHONE_SKIP)]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="Чтобы менеджер связался быстрее, оставьте номер телефона: нажмите кнопку ниже "
+                 "или напишите номер сообщением. Если не нужно, нажмите «Не нужно».",
+            reply_markup=keyboard,
+        )
+    except TelegramError:
+        context.bot_data["phone_wait"].pop(user.id, None)
+
+
+async def on_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Клиент прислал контакт или номер после заказа: передаём менеджерам. Всё остальное идёт дальше как раньше."""
+    msg, user = update.effective_message, update.effective_user
+    waits: dict = context.bot_data.get("phone_wait") or {}
+    wait = waits.get(user.id) if user else None
+    if not wait or time.time() > wait["until"]:
+        waits.pop(user.id, None) if user else None
+        return
+    if msg.contact:
+        phone = parse_phone(msg.contact.phone_number) or re.sub(r"[^\d+]", "", msg.contact.phone_number or "")
+    else:
+        text = (msg.text or "").strip()
+        if text == PHONE_SKIP:
+            waits.pop(user.id, None)
+            await msg.reply_text("Хорошо, менеджер напишет вам в Telegram.", reply_markup=ReplyKeyboardRemove())
+            raise ApplicationHandlerStop
+        phone = parse_phone(text)
+    if not phone:
+        return  # это не номер: обрабатываем как обычное сообщение
+    waits.pop(user.id, None)
+    order = (context.bot_data.get("orders") or {}).get(wait["order_id"])
+    managers = sorted(order["messages"]) if order else sorted(MANAGER_IDS)
+    who = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name or str(user.id))}</a>'
+    note = f"📞 Телефон клиента {who}: <code>{html.escape(phone)}</code>"
+    if wait.get("item"):
+        note += f"\nПо заказу: {html.escape(wait['item'])}"
+    for manager_id in managers:
+        try:
+            await context.bot.send_message(chat_id=manager_id, text=note, parse_mode=ParseMode.HTML)
+        except TelegramError as exc:
+            log.warning("Не удалось отправить телефон менеджеру %s: %s", manager_id, exc)
+    await msg.reply_text("Спасибо! Номер передан менеджеру.", reply_markup=ReplyKeyboardRemove())
+    raise ApplicationHandlerStop
 
 
 REPLIES = {
@@ -221,6 +298,8 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Старые посты: клиент перешёл в бота по ссылке и нажал «Старт»."""
     status = await create_order(context, update.effective_user)
     await update.message.reply_text(REPLIES[status])
+    if status == "ok":
+        await ask_phone(context, update.effective_user)
 
 
 def card_label(message) -> str:
@@ -240,6 +319,8 @@ async def on_order_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         status = await create_order(context, update.effective_user, section_key or None)
     await safe_answer(query, REPLIES[status], show_alert=True)
+    if status == "ok":
+        await ask_phone(context, update.effective_user)
 
 
 # ─────────────────────────── карточка товара из раздела «Разное» ───────────────────────────
@@ -305,6 +386,8 @@ async def on_item_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     label = f"{item.get('name', '')} — {showcase.price_text(item.get('price'))} (раздел «{context.bot_data.get('showcase_title', 'Разное')}»)"
     status = await create_order(context, update.effective_user, item=label)
     await safe_answer(query, REPLIES[status], show_alert=True)
+    if status == "ok":
+        await ask_phone(context, update.effective_user)
 
 
 async def on_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -683,6 +766,10 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_item_order, pattern=r"^ordi:"))
     app.add_handler(CallbackQueryHandler(on_take, pattern=r"^take:"))
     app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^(pub|full|cancel):"))
+    app.add_handler(  # раньше остальных: ловит только номер телефона клиента после заказа
+        MessageHandler(filters.ChatType.PRIVATE & (filters.CONTACT | (filters.TEXT & ~filters.COMMAND)), on_phone),
+        group=-1,
+    )
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
