@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -101,6 +101,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if args and args[0] == "order":
         await handle_order(update, context)
+        return
+    item_id = showcase.parse_start_arg(args[0]) if args else None
+    if item_id:  # номер из списка раздела «Разное» в канале
+        await show_item(update, context, item_id)
         return
 
     user_id = update.effective_user.id
@@ -235,6 +239,71 @@ async def on_order_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         status = await create_order(context, update.effective_user, item=item)
     else:
         status = await create_order(context, update.effective_user, section_key or None)
+    await safe_answer(query, REPLIES[status], show_alert=True)
+
+
+# ─────────────────────────── карточка товара из раздела «Разное» ───────────────────────────
+async def get_item(context: ContextTypes.DEFAULT_TYPE, item_id: int):
+    """Товар из раздела: сначала из памяти, при промахе спрашиваем учёт (его могли только что добавить)."""
+    items = context.bot_data.get("showcase_items") or {}
+    if item_id in items:
+        return items[item_id]
+    if showcase.enabled():
+        try:
+            info = await showcase.fetch_info()
+            if info:
+                showcase.remember(context.bot_data, info)
+                return context.bot_data["showcase_items"].get(item_id)
+        except Exception as exc:
+            log.warning("Раздел «Разное»: не удалось получить товар %s: %s", item_id, exc)
+    return None
+
+
+def item_keyboard(item: dict, item_id: int, state: dict) -> InlineKeyboardMarkup:
+    rows = []
+    if item:
+        rows.append([InlineKeyboardButton("🛒 Заказать", callback_data=f"ordi:{item_id}")])
+    page = int((item or {}).get("page") or 0) or int((state.get("extra") or {}).get("hub") or 0)
+    if page:
+        rows.append([InlineKeyboardButton("⬅️ Обратно к выбору", url=channel_mod.message_url(CHANNEL, page))])
+    if state.get("menu_id"):
+        rows.append([InlineKeyboardButton("📋 В каталог канала", url=channel_mod.message_url(CHANNEL, state["menu_id"]))])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_item(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int) -> None:
+    item = await get_item(context, item_id)
+    state = await get_state(context)
+    msg = update.effective_message
+    if not item:
+        await msg.reply_text("Этого товара уже нет в разделе: возможно, его купили. Вернитесь к списку.",
+                             reply_markup=item_keyboard(None, item_id, state))
+        return
+    caption = showcase.item_text(item)
+    keyboard = item_keyboard(item, item_id, state)
+    photos = [p for p in (item.get("photos") or []) if p]
+    try:
+        if len(photos) == 1 and len(caption) <= 1000:
+            await msg.reply_photo(photos[0], caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            return
+        if photos:
+            await msg.reply_media_group([InputMediaPhoto(p) for p in photos[:10]])
+    except TelegramError as exc:  # файл не открылся: показываем карточку без фото, заказ всё равно работает
+        log.warning("Раздел «Разное»: фото товара %s не отправилось: %s", item_id, exc)
+    await msg.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                         link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+async def on_item_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Клиент нажал «Заказать» в карточке товара (в чате с ботом)."""
+    query = update.callback_query
+    item_id = (query.data or "").partition(":")[2]
+    item = await get_item(context, int(item_id)) if item_id.isdigit() else None
+    if not item:
+        await safe_answer(query, "Этого товара уже нет в наличии.", show_alert=True)
+        return
+    label = f"{item.get('name', '')} — {showcase.price_text(item.get('price'))} (раздел «{context.bot_data.get('showcase_title', 'Разное')}»)"
+    status = await create_order(context, update.effective_user, item=label)
     await safe_answer(query, REPLIES[status], show_alert=True)
 
 
@@ -543,6 +612,7 @@ async def showcase_tick(ctx) -> None:
     if info is None:
         log.warning("Раздел «Разное»: учёт не принял SYNC_KEY")
         return
+    showcase.remember(ctx.bot_data, info)
     state = await get_state(ctx)
     extra, changed, refresh = showcase.decide(info, state)
     if not state.get("menu_id"):  # каталога в канале ещё нет: кнопка раздела появится при первой публикации
@@ -610,6 +680,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_notify, pattern=r"^notify"))
     app.add_handler(CallbackQueryHandler(on_off, pattern=r"^off"))
     app.add_handler(CallbackQueryHandler(on_order_button, pattern=r"^order(:|$)"))
+    app.add_handler(CallbackQueryHandler(on_item_order, pattern=r"^ordi:"))
     app.add_handler(CallbackQueryHandler(on_take, pattern=r"^take:"))
     app.add_handler(CallbackQueryHandler(on_decision, pattern=r"^(pub|full|cancel):"))
     app.add_handler(
