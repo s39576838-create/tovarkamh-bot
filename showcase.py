@@ -1,17 +1,22 @@
 """Раздел «Разное»: товары приходят из учёта (Google Apps Script).
 
-Бот учёта сам публикует карточки в канал от имени этого бота (так кнопку «Заказать»
-принимает он). Здесь бот раз в минуту спрашивает у учёта, что нового, и
+В канале раздел — это страницы-списки «1. Название – цена» с кнопками-номерами; их публикует
+бот учёта от имени этого бота (без звука). Номер ведёт в чат с ботом (t.me/<бот>?start=p<номер>),
+где бот показывает фото, цену, характеристики и кнопку «Заказать». Здесь бот раз в минуту
+спрашивает у учёта, что нового, и
 
   * показывает раздел кнопкой в меню «Каталог»;
-  * после того как карточки перестали появляться, снова отправляет меню в самый низ канала.
+  * запоминает товары для карточек;
+  * после того как страницы перестали меняться, снова отправляет меню в самый низ канала.
 
 Файл не зависит от Telegram, поэтому логику решения можно проверять отдельно.
 """
 
 import asyncio
 import json
+import html
 import os
+import re
 import urllib.parse
 import urllib.request
 
@@ -54,3 +59,36 @@ def decide(info: dict, state: dict, quiet: int = QUIET):
     buried = bool(menu_id) and int(info.get("last") or 0) > menu_id
     calm = int(info.get("since") or 0) >= quiet
     return extra, changed, bool(menu_id) and (changed or buried) and calm
+
+
+START_RE = re.compile(r"^p(\d{1,9})$")
+
+
+def parse_start_arg(arg):
+    """'p12' -> 12 (ссылка из списка в канале), иначе None."""
+    m = START_RE.match(arg or "")
+    return int(m.group(1)) if m else None
+
+
+def remember(bot_data: dict, info: dict) -> None:
+    """Запоминает товары из ответа учёта: {id: {...}}. Полный список заменяет прежний."""
+    items = {}
+    for it in info.get("items") or []:
+        try:
+            items[int(it["id"])] = it
+        except (KeyError, TypeError, ValueError):
+            continue
+    bot_data["showcase_items"] = items
+    bot_data["showcase_title"] = str(info.get("title") or "Разное")
+
+
+def price_text(price) -> str:
+    return f"{int(round(float(price or 0))):,}".replace(",", " ") + "₽"
+
+
+def item_text(it: dict) -> str:
+    """Подпись карточки: название, цена, характеристики (HTML)."""
+    text = f"<b>{html.escape(str(it.get('name', '')))}</b>\n{price_text(it.get('price'))}"
+    if it.get("text"):
+        text += "\n\n" + html.escape(str(it["text"]))
+    return text
